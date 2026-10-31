@@ -81,6 +81,15 @@ type handshakeResult struct {
 
 const pingRoom = "pinglkasjdlfjsaldjf"
 
+// Handshake frames are small control messages. Bound each read before its
+// advertised body is allocated, independently of the larger transfer limit.
+const (
+	maxHandshakeFirstMessageSize  = 64 * 1024
+	maxHandshakeSaltSize          = 64
+	defaultHandshakePasswordLimit = 4 * 1024
+	maxHandshakeRoomSize          = 1024
+)
+
 // newDefaultServer initializes a new server, with some default configuration options
 func newDefaultServer() *server {
 	s := new(server)
@@ -429,7 +438,7 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 		return c.Send(message)
 	}
 
-	Abytes, err := c.ReceiveWithDeadline(firstMessageDeadline)
+	Abytes, err := c.ReceiveWithDeadlineLimit(firstMessageDeadline, maxHandshakeFirstMessageSize)
 	if err != nil {
 		return handshakeResult{}, fmt.Errorf("read first relay message: %w", err)
 	}
@@ -467,7 +476,7 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 		return
 	}
 	// receive salt
-	salt, err := c.ReceiveWithDeadline(deadline)
+	salt, err := c.ReceiveWithDeadlineLimit(deadline, maxHandshakeSaltSize)
 	if err != nil {
 		return
 	}
@@ -477,11 +486,18 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 	}
 
 	log.Debugf("waiting for password")
-	passwordBytesEnc, err := c.ReceiveWithDeadline(deadline)
+	passwordCipher, err := crypt.NewAESGCM(strongKeyForEncryption)
 	if err != nil {
 		return
 	}
-	passwordBytes, err := crypt.Decrypt(passwordBytesEnc, strongKeyForEncryption)
+	// Preserve long operator-configured passwords without letting the peer's
+	// length header determine the allocation limit. Include nonce and tag bytes.
+	passwordLimit := max(defaultHandshakePasswordLimit, len(s.password)+passwordCipher.NonceSize()+passwordCipher.Overhead())
+	passwordBytesEnc, err := c.ReceiveWithDeadlineLimit(deadline, passwordLimit)
+	if err != nil {
+		return
+	}
+	passwordBytes, err := crypt.DecryptAEAD(passwordBytesEnc, passwordCipher)
 	if err != nil {
 		return
 	}
@@ -507,7 +523,7 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 		if earlyDeadline.After(deadline) {
 			earlyDeadline = deadline
 		}
-		earlyRoom, err = c.ReceiveWithDeadline(earlyDeadline)
+		earlyRoom, err = c.ReceiveWithDeadlineLimit(earlyDeadline, maxHandshakeRoomSize)
 		if err != nil {
 			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 				return handshakeResult{}, err
@@ -547,7 +563,7 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 	// wait for client to tell me which room they want
 	log.Debug("waiting for answer")
 	if result.room == "" {
-		enc, receiveErr := c.ReceiveWithDeadline(deadline)
+		enc, receiveErr := c.ReceiveWithDeadlineLimit(deadline, maxHandshakeRoomSize)
 		if receiveErr != nil {
 			return handshakeResult{}, receiveErr
 		}
